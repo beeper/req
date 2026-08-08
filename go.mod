@@ -10,7 +10,6 @@ require (
 	github.com/quic-go/qpack v0.6.0
 	github.com/quic-go/quic-go v0.61.0
 	github.com/refraction-networking/utls v1.8.2
-	go.mau.fi/util v0.9.11
 	golang.org/x/net v0.57.0
 	golang.org/x/text v0.40.0
 )
