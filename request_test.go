@@ -132,6 +132,12 @@ func TestSendMethods(t *testing.T) {
 		},
 		{
 			SendReq: func(req *Request) (resp *Response, err error) {
+				return req.Query("/")
+			},
+			ExpectMethod: "QUERY",
+		},
+		{
+			SendReq: func(req *Request) (resp *Response, err error) {
 				return req.Send("GET", "/")
 			},
 			ExpectMethod: "GET",
@@ -921,6 +927,76 @@ func TestUploadMultipart(t *testing.T) {
 	tests.AssertContains(t, resp.String(), "sample-file.txt", true)
 	tests.AssertContains(t, resp.String(), "value1", true)
 	tests.AssertContains(t, resp.String(), "value2", true)
+}
+
+func TestMultipartFileIsStreamedWithContentLength(t *testing.T) {
+	c := tc()
+	r := c.R().
+		SetFile("file", tests.GetTestFilePath("sample-image.png")).
+		SetFormData(map[string]string{"param": "value"})
+
+	err := handleMultiPart(c, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Body != nil {
+		t.Fatal("multipart body was buffered in memory")
+	}
+	if r.contentLength <= r.uploadFiles[0].FileSize {
+		t.Fatalf("invalid multipart content length: %d", r.contentLength)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		r.RetryAttempt = attempt
+		body, err := r.GetBody()
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := io.Copy(io.Discard, body)
+		body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != r.contentLength {
+			t.Fatalf("body length is %d, want %d", n, r.contentLength)
+		}
+	}
+}
+
+func TestMultipartReaderWithUnknownSizeIsStreamed(t *testing.T) {
+	c := tc()
+	r := c.R().SetFileReader("file", "file.txt", strings.NewReader("test"))
+
+	err := handleMultiPart(c, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Body != nil {
+		t.Fatal("multipart body was buffered in memory")
+	}
+	if r.contentLength != -1 {
+		t.Fatalf("content length is %d, want -1", r.contentLength)
+	}
+	body, err := r.GetBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := io.Copy(io.Discard, body)
+	body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n <= int64(len("test")) {
+		t.Fatalf("multipart body is unexpectedly short: %d", n)
+	}
+}
+
+func TestMultipartReaderCannotBeRetried(t *testing.T) {
+	_, err := tc().R().
+		SetRetryCount(1).
+		SetFileReader("file", "file.txt", strings.NewReader("test")).
+		Post("/file-text")
+	tests.AssertEqual(t, errRetryableWithUnReplayableBody, err)
 }
 
 func TestFixPragmaCache(t *testing.T) {
