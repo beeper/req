@@ -76,8 +76,8 @@ type Transport struct {
 
 	// Dial specifies an optional dial function for creating QUIC
 	// connections for requests.
-	// If Dial is nil, a UDPConn will be created at the first request
-	// and will be reused for subsequent connections to other servers.
+	// If Dial is nil, DialContext is used when set. Otherwise, a UDPConn
+	// is created at the first request and reused for subsequent connections.
 	Dial func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error)
 
 	// Enable support for HTTP/3 datagrams (RFC 9297).
@@ -126,6 +126,30 @@ var (
 	ErrTransportClosed = errors.New("http3: transport is closed")
 )
 
+type DialError struct {
+	error
+}
+
+func (e *DialError) Unwrap() error {
+	return e.error
+}
+
+type connectedPacketConn struct {
+	net.Conn
+}
+
+func (c connectedPacketConn) ReadFrom(buf []byte) (int, net.Addr, error) {
+	n, err := c.Read(buf)
+	return n, c.RemoteAddr(), err
+}
+
+func (c connectedPacketConn) WriteTo(buf []byte, addr net.Addr) (int, error) {
+	if addr.String() != c.RemoteAddr().String() {
+		return 0, net.InvalidAddrError("connected UDP peer changed")
+	}
+	return c.Write(buf)
+}
+
 func (t *Transport) init() error {
 	if t.newClientConn == nil {
 		t.newClientConn = func(conn *quic.Conn) clientConn {
@@ -159,7 +183,7 @@ func (t *Transport) init() error {
 	if t.QUICConfig.MaxIncomingStreams == 0 {
 		t.QUICConfig.MaxIncomingStreams = -1 // don't allow any bidirectional streams
 	}
-	if t.Dial == nil {
+	if t.Dial == nil && (t.Options == nil || t.DialContext == nil) {
 		udpConn, err := net.ListenUDP("udp", nil)
 		if err != nil {
 			return err
@@ -366,11 +390,15 @@ func (t *Transport) getClient(ctx context.Context, hostname string, onlyCached b
 }
 
 func (t *Transport) dial(ctx context.Context, hostname string) (*quic.Conn, clientConn, error) {
+	tlsConfig := t.TLSClientConfig
+	if tlsConfig == nil && t.Options != nil {
+		tlsConfig = t.Options.TLSClientConfig
+	}
 	var tlsConf *tls.Config
-	if t.TLSClientConfig == nil {
+	if tlsConfig == nil {
 		tlsConf = &tls.Config{}
 	} else {
-		tlsConf = t.TLSClientConfig.Clone()
+		tlsConf = tlsConfig.Clone()
 	}
 	if tlsConf.ServerName == "" {
 		sni, _, err := net.SplitHostPort(hostname)
@@ -384,6 +412,21 @@ func (t *Transport) dial(ctx context.Context, hostname string) (*quic.Conn, clie
 	tlsConf.NextProtos = []string{NextProtoH3}
 
 	dial := t.Dial
+	if dial == nil && t.Options != nil && t.DialContext != nil {
+		dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			udp, err := t.DialContext(ctx, "udp", addr)
+			if err != nil {
+				return nil, &DialError{err}
+			}
+			conn, err := quic.Dial(ctx, connectedPacketConn{udp}, udp.RemoteAddr(), tlsCfg, cfg)
+			if err != nil {
+				_ = udp.Close()
+				return nil, &DialError{err}
+			}
+			context.AfterFunc(conn.Context(), func() { _ = udp.Close() })
+			return conn, nil
+		}
+	}
 	if dial == nil {
 		dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 			network := "udp"

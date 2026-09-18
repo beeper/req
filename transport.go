@@ -47,6 +47,7 @@ import (
 	"github.com/imroc/req/v3/internal/util"
 	"github.com/imroc/req/v3/pkg/altsvc"
 	reqtls "github.com/imroc/req/v3/pkg/tls"
+	"github.com/quic-go/quic-go"
 	htmlcharset "golang.org/x/net/html/charset"
 	"golang.org/x/text/encoding/ianaindex"
 
@@ -145,6 +146,8 @@ type Transport struct {
 	wrappedRoundTrip      http.RoundTripper
 	httpRoundTripWrappers []HttpRoundTripWrapper
 }
+
+type HTTP3DialError = http3.DialError
 
 // NewTransport is an alias of T
 func NewTransport() *Transport {
@@ -473,8 +476,8 @@ func (t *Transport) SetProxy(proxy func(*http.Request) (*url.URL, error)) *Trans
 	return t
 }
 
-// SetDial set the custom DialContext function, only valid for HTTP1 and HTTP2, which specifies the
-// dial function for creating unencrypted TCP connections.
+// SetDial set the custom DialContext function, which specifies the
+// dial function for creating TCP or UDP connections.
 // If it is nil, then the transport dials using package net.
 //
 // The dial function runs concurrently with calls to RoundTrip.
@@ -551,6 +554,14 @@ func (t *Transport) EnableForceHTTP3() *Transport {
 	t.EnableHTTP3()
 	if t.t3 != nil {
 		t.forceHttpVersion = h3
+	}
+	return t
+}
+
+func (t *Transport) SetHTTP3QUICConfig(config *quic.Config) *Transport {
+	t.EnableHTTP3()
+	if t.t3 != nil {
+		t.t3.QUICConfig = config
 	}
 	return t
 }
@@ -776,6 +787,9 @@ func (t *Transport) Clone() *Transport {
 	}
 	if t.t3 != nil {
 		tt.EnableHTTP3()
+		if t.t3.QUICConfig != nil {
+			tt.t3.QUICConfig = t.t3.QUICConfig.Clone()
+		}
 	}
 	return tt
 }
@@ -1225,6 +1239,17 @@ func (t *Transport) CloseIdleConnections() {
 	if t2 := t.t2; t2 != nil {
 		t2.CloseIdleConnections()
 	}
+	if t3 := t.t3; t3 != nil {
+		t3.CloseIdleConnections()
+	}
+}
+
+func (t *Transport) Close() error {
+	t.CloseIdleConnections()
+	if t.t3 != nil {
+		return t.t3.Close()
+	}
+	return nil
 }
 
 // prepareTransportCancel sets up state to convert Transport.CancelRequest into context cancellation.
