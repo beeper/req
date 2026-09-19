@@ -229,6 +229,9 @@ type ClientConn struct {
 	br              *bufio.Reader
 	lastActive      time.Time
 	lastIdle        time.Time // time last idle
+
+	initialStreamRecvWindow int32
+
 	// Settings from peer: (also guarded by wmu)
 	maxFrameSize          uint32
 	maxConcurrentStreams  uint32
@@ -766,6 +769,12 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 		}
 		if max := t.maxHeaderListSize(); max != 0 {
 			initialSettings = append(initialSettings, http2.Setting{ID: http2.SettingMaxHeaderListSize, Val: max})
+		}
+	}
+	cc.initialStreamRecvWindow = initialWindowSize
+	for _, setting := range initialSettings {
+		if setting.ID == http2.SettingInitialWindowSize {
+			cc.initialStreamRecvWindow = int32(setting.Val)
 		}
 	}
 
@@ -2202,7 +2211,7 @@ type resAndError struct {
 func (cc *ClientConn) addStreamLocked(cs *clientStream) {
 	cs.flow.add(int32(cc.initialWindowSize))
 	cs.flow.setConnFlow(&cc.flow)
-	cs.inflow.init(transportDefaultStreamFlow)
+	cs.inflow.init(cc.initialStreamRecvWindow)
 	cs.ID = cc.nextStreamID
 	cc.nextStreamID += 2
 	cc.streams[cs.ID] = cs
