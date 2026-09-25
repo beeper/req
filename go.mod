@@ -1,25 +1,25 @@
 module github.com/imroc/req/v3
 
-go 1.25.0
+go 1.26.0
 
 require (
-	github.com/andybalholm/brotli v1.2.2
+	github.com/andybalholm/brotli v1.2.4
 	github.com/google/go-querystring v1.2.0
 	github.com/icholy/digest v1.2.0
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.0
 	github.com/quic-go/qpack v0.6.0
 	github.com/quic-go/quic-go v0.61.0
 	github.com/refraction-networking/utls v1.8.2
-	go.mau.fi/util v0.9.11
-	golang.org/x/net v0.57.0
-	golang.org/x/text v0.40.0
+	go.mau.fi/util v0.10.1
+	golang.org/x/net v0.59.0
+	golang.org/x/text v0.42.0
 )
 
 require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/xyproto/randomstring v1.2.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )

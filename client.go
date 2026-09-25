@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/netip"
 	urlpkg "net/url"
 	"os"
 	"reflect"
@@ -1016,6 +1018,16 @@ func (c *Client) SetHTTP2PriorityFrames(frames ...http2.PriorityFrame) *Client {
 	return c
 }
 
+// SetHTTP2NextStreamID sets the stream ID of the first client-initiated
+// stream on new HTTP/2 connections (default 1). Some clients use a
+// different starting value (e.g. OkHttp starts at 3), which is part of
+// their HTTP/2 fingerprint. The value must be odd and fit into 31 bits
+// (RFC 9113); invalid values are ignored.
+func (c *Client) SetHTTP2NextStreamID(id uint32) *Client {
+	c.Transport.SetHTTP2NextStreamID(id)
+	return c
+}
+
 // SetCommonContentType set the `Content-Type` header for requests fired
 // from the client.
 func (c *Client) SetCommonContentType(ct string) *Client {
@@ -1490,6 +1502,118 @@ func (c *Client) SetUnixSocket(file string) *Client {
 	})
 }
 
+// SetResolver sets a custom DNS resolver used when dialing HTTP/1 and HTTP/2
+// connections. It is implemented via SetDial and a net.Dialer that uses r.
+// If r is nil, the default resolver is used.
+//
+// Only valid for HTTP/1 and HTTP/2 (same limitation as SetDial). Calling
+// SetDial, SetHosts, or SetUnixSocket replaces this dialer.
+//
+// For example, use a specific DNS server:
+//
+//	r := &net.Resolver{
+//		PreferGo: true,
+//		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+//			var d net.Dialer
+//			return d.DialContext(ctx, "udp", "1.1.1.1:53")
+//		},
+//	}
+//	client.SetResolver(r)
+func (c *Client) SetResolver(r *net.Resolver) *Client {
+	return c.SetDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := net.Dialer{Resolver: r}
+		return d.DialContext(ctx, network, addr)
+	})
+}
+
+// SetHosts configures a static hostname-to-IP mapping used when dialing HTTP/1
+// and HTTP/2 connections (like a hosts file). Hostnames not present in the map
+// fail immediately with a "no such host" DNS error and do not consult the
+// system resolver. This avoids long DNS timeouts when maintaining a custom
+// host list (e.g. crawlers).
+//
+// Notes:
+//   - Keys are hostnames only (no port). Matching is case-insensitive and
+//     IDNA-normalized to match the dial address form used by the transport.
+//   - Values must be literal IP addresses (IPv4 or IPv6). Optional surrounding
+//     brackets on IPv6 (e.g. "[::1]") are accepted and normalized. Non-IP
+//     values never fall through to system DNS; dialing that host returns a
+//     clear error instead.
+//   - IP-literal request addresses (e.g. https://1.2.3.4/) skip the map and
+//     dial directly. Scoped IPv6 literals (e.g. https://[fe80::1%25eth0]/)
+//     are supported.
+//   - An empty or nil map makes every non-literal hostname fail closed.
+//   - Proxy routing is rejected while SetHosts is active because a proxy can
+//     resolve the destination remotely and bypass the static mapping.
+//   - Only valid for HTTP/1 and HTTP/2 (same limitation as SetDial). SetDialTLS
+//     still bypasses this dialer for HTTPS when set. Calling SetDial,
+//     SetResolver, or SetUnixSocket replaces this dialer.
+//   - The map is copied; later changes to the caller's map are ignored.
+//
+// For example:
+//
+//	client.SetHosts(map[string]string{
+//		"api.internal": "10.0.0.5",
+//		"db.internal":  "10.0.0.6",
+//		"v6.internal":  "::1",
+//	})
+func (c *Client) SetHosts(hosts map[string]string) *Client {
+	m := make(map[string]string, len(hosts))
+	invalid := make(map[string]string)
+	for host, ipStr := range hosts {
+		key := hostsMapKey(host)
+		if key == "" {
+			continue
+		}
+		ip := net.ParseIP(strings.Trim(ipStr, "[]"))
+		if ip == nil {
+			invalid[key] = ipStr
+			continue
+		}
+		m[key] = ip.String()
+	}
+	c.SetDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		// IP literals need no DNS and are not subject to the hosts map.
+		if _, err := netip.ParseAddr(host); err == nil {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		}
+		key := hostsMapKey(host)
+		if raw, bad := invalid[key]; bad {
+			return nil, fmt.Errorf("req: SetHosts: invalid IP address %q for host %q", raw, host)
+		}
+		ip, ok := m[key]
+		if !ok {
+			return nil, &net.DNSError{
+				Err:        "no such host",
+				Name:       host,
+				IsNotFound: true,
+			}
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+	})
+	c.Transport.rejectProxyWithSetHosts = true
+	return c
+}
+
+// hostsMapKey normalizes a hostname for SetHosts lookup: trim, IDNA ToASCII,
+// then lowercase so keys match dial addresses produced by the transport.
+func hostsMapKey(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if ascii, err := idnaASCII(host); err == nil {
+		host = ascii
+	}
+	return strings.ToLower(host)
+}
+
 // DisableHTTP3 disables the http3 protocol.
 func (c *Client) DisableHTTP3() *Client {
 	c.Transport.DisableHTTP3()
@@ -1784,6 +1908,22 @@ func (c *Client) roundTrip(r *Request) (resp *Response, err error) {
 	if r.unReplayableBody != nil {
 		getBody = nil
 	}
+	if r.uploadLimit > 0 {
+		limit := r.uploadLimit
+		if reqBody != nil {
+			reqBody = newRateLimitedReadCloser(reqBody, limit)
+		}
+		if getBody != nil {
+			inner := getBody
+			getBody = func() (io.ReadCloser, error) {
+				rc, err := inner()
+				if err != nil || rc == nil {
+					return rc, err
+				}
+				return newRateLimitedReadCloser(rc, limit), nil
+			}
+		}
+	}
 	req := &http.Request{
 		Method:        r.Method,
 		Header:        r.Headers.Clone(),
@@ -1800,8 +1940,15 @@ func (c *Client) roundTrip(r *Request) (resp *Response, err error) {
 	for _, cookie := range r.Cookies {
 		req.AddCookie(cookie)
 	}
+	var bodyWraps []wrapResponseBodyFunc
+	if r.downloadLimit > 0 {
+		limit := r.downloadLimit
+		bodyWraps = append(bodyWraps, func(rc io.ReadCloser) io.ReadCloser {
+			return newRateLimitedReadCloser(rc, limit)
+		})
+	}
 	if r.isSaveResponse && r.downloadCallback != nil {
-		var wrap wrapResponseBodyFunc = func(rc io.ReadCloser) io.ReadCloser {
+		bodyWraps = append(bodyWraps, func(rc io.ReadCloser) io.ReadCloser {
 			return &callbackReader{
 				ReadCloser: rc,
 				callback: func(read int64) {
@@ -1813,6 +1960,14 @@ func (c *Client) roundTrip(r *Request) (resp *Response, err error) {
 				lastTime: time.Now(),
 				interval: r.downloadCallbackInterval,
 			}
+		})
+	}
+	if len(bodyWraps) > 0 {
+		var wrap wrapResponseBodyFunc = func(rc io.ReadCloser) io.ReadCloser {
+			for _, w := range bodyWraps {
+				rc = w(rc)
+			}
+			return rc
 		}
 		if ctx == nil {
 			ctx = context.Background()

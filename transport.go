@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -128,6 +129,10 @@ type Transport struct {
 
 	// Force using specific http version
 	forceHttpVersion httpVersion
+
+	// rejectProxyWithSetHosts prevents proxy-side DNS from bypassing the
+	// fail-closed static host mapping installed by Client.SetHosts.
+	rejectProxyWithSetHosts bool
 
 	transport.Options
 
@@ -441,6 +446,22 @@ func (t *Transport) SetHTTP2PriorityFrames(frames ...http2.PriorityFrame) *Trans
 	return t
 }
 
+// SetHTTP2NextStreamID sets the stream ID of the first client-initiated
+// stream on new HTTP/2 connections (default 1). Some clients use a
+// different starting value (e.g. OkHttp starts at 3), which is part of
+// their HTTP/2 fingerprint. The value must be odd and fit into 31 bits
+// (RFC 9113); invalid values are ignored. If priority frames are also
+// configured (see SetHTTP2PriorityFrames), the counter advances past the
+// stream IDs they claim, so their stream IDs should be greater than or
+// equal to this value and given in increasing order.
+func (t *Transport) SetHTTP2NextStreamID(id uint32) *Transport {
+	if id%2 == 0 || id > math.MaxInt32 {
+		return t
+	}
+	t.t2.NextStreamID = id
+	return t
+}
+
 // SetTLSClientConfig set the custom TLSClientConfig, which specifies the TLS configuration to
 // use with tls.Client.
 // If nil, the default configuration is used.
@@ -482,6 +503,7 @@ func (t *Transport) SetProxy(proxy func(*http.Request) (*url.URL, error)) *Trans
 // earlier connection becomes idle before the later dial function completes.
 func (t *Transport) SetDial(fn func(ctx context.Context, network, addr string) (net.Conn, error)) *Transport {
 	t.DialContext = fn
+	t.rejectProxyWithSetHosts = false
 	return t
 }
 
@@ -743,13 +765,14 @@ func (t *Transport) readBufferSize() int {
 // Clone returns a deep copy of t's exported fields.
 func (t *Transport) Clone() *Transport {
 	tt := &Transport{
-		Headers:               t.Headers.Clone(),
-		Cookies:               cloneSlice(t.Cookies),
-		Options:               t.Options.Clone(),
-		disableAutoDecode:     t.disableAutoDecode,
-		autoDecodeContentType: t.autoDecodeContentType,
-		forceHttpVersion:      t.forceHttpVersion,
-		httpRoundTripWrappers: t.httpRoundTripWrappers,
+		Headers:                 t.Headers.Clone(),
+		Cookies:                 cloneSlice(t.Cookies),
+		Options:                 t.Options.Clone(),
+		disableAutoDecode:       t.disableAutoDecode,
+		autoDecodeContentType:   t.autoDecodeContentType,
+		forceHttpVersion:        t.forceHttpVersion,
+		rejectProxyWithSetHosts: t.rejectProxyWithSetHosts,
+		httpRoundTripWrappers:   t.httpRoundTripWrappers,
 	}
 	if len(tt.httpRoundTripWrappers) > 0 { // clone transport middleware
 		fn := func(req *http.Request) (*http.Response, error) {
@@ -772,6 +795,7 @@ func (t *Transport) Clone() *Transport {
 			Settings:                   cloneSlice(t.t2.Settings),
 			HeaderPriority:             t.t2.HeaderPriority,
 			PriorityFrames:             cloneSlice(t.t2.PriorityFrames),
+			NextStreamID:               t.t2.NextStreamID,
 		}
 	}
 	if t.t3 != nil {
@@ -1274,6 +1298,9 @@ func (t *Transport) connectMethodForRequest(treq *transportRequest) (cm connectM
 	cm.targetAddr = canonicalAddr(treq.URL)
 	if t.Proxy != nil {
 		cm.proxyURL, err = t.Proxy(treq.Request)
+		if err == nil && cm.proxyURL != nil && t.rejectProxyWithSetHosts {
+			err = errors.New("req: SetHosts cannot be used with a proxy")
+		}
 	}
 	cm.onlyH1 = t.forceHttpVersion == h1 || requestRequiresHTTP1(treq.Request)
 	return cm, err
