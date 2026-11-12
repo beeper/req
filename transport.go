@@ -1110,6 +1110,16 @@ func (t *Transport) roundTrip(req *http.Request) (resp *http.Response, err error
 	}
 }
 
+type noDialH2RoundTripper struct{ t2 *h2internal.Transport }
+
+func (rt noDialH2RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := rt.t2.RoundTripOnlyCachedConn(req)
+	if h2internal.CanRetryError(err) {
+		return nil, h2internal.ErrNoCachedConn
+	}
+	return resp, err
+}
+
 func awaitLegacyCancel(ctx context.Context, cancel context.CancelCauseFunc, req *http.Request) {
 	select {
 	case <-req.Cancel:
@@ -2308,7 +2318,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 			} else if !used {
 				go pconn.conn.Close()
 			}
-			return &persistConn{t: t, cacheKey: pconn.cacheKey, alt: t.t2}, nil
+			return &persistConn{t: t, cacheKey: pconn.cacheKey, alt: noDialH2RoundTripper{t.t2}}, nil
 		}
 	}
 
